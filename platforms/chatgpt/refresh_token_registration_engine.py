@@ -446,12 +446,14 @@ class RefreshTokenRegistrationEngine:
                     self._log("4. 若命中 about_you，则在 OAuth 会话内提交姓名+生日，再继续 workspace/token")
                     oauth_screen_hint = "login"
                     oauth_force_password_login = False
+                    oauth_force_chatgpt_entry = False
                     if registration_message == "pending_about_you_submission":
                         oauth_screen_hint = "login"
                         oauth_force_password_login = True
+                        oauth_force_chatgpt_entry = True
                         self._log(
                             "OAuth 使用 screen_hint=login + force_password_login "
-                            "以完成密码登录 → OTP → about_you"
+                            "并复刻 ChatGPT 首页启动步骤，完成密码登录 → OTP → about_you"
                         )
 
                     tokens = oauth_client.login_and_get_tokens(
@@ -465,6 +467,7 @@ class RefreshTokenRegistrationEngine:
                         prefer_passwordless_login=not oauth_force_password_login,
                         allow_phone_verification=False,
                         force_new_browser=True,
+                        force_chatgpt_entry=oauth_force_chatgpt_entry,
                         screen_hint=oauth_screen_hint,
                         force_password_login=oauth_force_password_login,
                         complete_about_you_if_needed=True,

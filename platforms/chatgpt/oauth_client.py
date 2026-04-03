@@ -483,6 +483,133 @@ class OAuthClient:
 
         return authorize_final_url
 
+    def _bootstrap_chatgpt_entry(
+        self,
+        email: str,
+        device_id: str,
+        *,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ) -> str:
+        """模拟注册链路一致的 ChatGPT 首页 -> CSRF -> signin/openai。"""
+        homepage_url = "https://chatgpt.com/"
+        csrf_url = "https://chatgpt.com/api/auth/csrf"
+        signin_url = "https://chatgpt.com/api/auth/signin/openai"
+
+        try:
+            self._log("force_chatgpt_entry: 访问 ChatGPT 首页...")
+            self._browser_pause()
+            r_home = self.session.get(
+                homepage_url,
+                headers=self._headers(
+                    homepage_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    navigation=True,
+                ),
+                allow_redirects=True,
+                timeout=30,
+            )
+            self._log(f"force_chatgpt_entry: 首页状态 {r_home.status_code}")
+        except Exception as e:
+            self._log(f"force_chatgpt_entry: 首页访问异常: {e}")
+
+        csrf_token = ""
+        try:
+            self._log("force_chatgpt_entry: 获取 CSRF token...")
+            r_csrf = self.session.get(
+                csrf_url,
+                headers=self._headers(
+                    csrf_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="application/json",
+                    referer=homepage_url,
+                    fetch_site="same-origin",
+                ),
+                timeout=30,
+            )
+            if r_csrf.status_code == 200:
+                csrf_token = (r_csrf.json() or {}).get("csrfToken", "") or ""
+                if csrf_token:
+                    self._log(f"force_chatgpt_entry: CSRF token={csrf_token[:16]}...")
+        except Exception as e:
+            self._log(f"force_chatgpt_entry: 获取 CSRF 异常: {e}")
+
+        authorize_url = ""
+        try:
+            self._log("force_chatgpt_entry: 提交邮箱获取 authorize URL...")
+            params = {
+                "prompt": "login",
+                "ext-oai-did": device_id,
+                "auth_session_logging_id": str(uuid.uuid4()),
+                "screen_hint": "login_or_signup",
+                "login_hint": email,
+            }
+            form_data = {
+                "callbackUrl": "https://chatgpt.com/",
+                "csrfToken": csrf_token,
+                "json": "true",
+            }
+            r_signin = self.session.post(
+                signin_url,
+                params=params,
+                data=form_data,
+                headers=self._headers(
+                    signin_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="application/json",
+                    referer=homepage_url,
+                    origin="https://chatgpt.com",
+                    content_type="application/x-www-form-urlencoded",
+                    fetch_site="same-origin",
+                ),
+                timeout=30,
+            )
+            if r_signin.status_code == 200:
+                authorize_url = (r_signin.json() or {}).get("url", "") or ""
+                if authorize_url:
+                    self._log("force_chatgpt_entry: 已获取 authorize URL")
+            else:
+                self._log(
+                    f"force_chatgpt_entry: authorize URL 获取失败 {r_signin.status_code}"
+                )
+        except Exception as e:
+            self._log(f"force_chatgpt_entry: 提交邮箱异常: {e}")
+
+        if not authorize_url:
+            return ""
+
+        try:
+            self._log("force_chatgpt_entry: 访问 authorize URL...")
+            self._browser_pause()
+            kwargs = {
+                "headers": self._headers(
+                    authorize_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=homepage_url,
+                    navigation=True,
+                ),
+                "allow_redirects": True,
+                "timeout": 30,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+            r_auth = self.session.get(authorize_url, **kwargs)
+            final_url = str(r_auth.url)
+            self._log(
+                f"force_chatgpt_entry: authorize 最终跳转 {final_url[:160]}"
+            )
+            return final_url
+        except Exception as e:
+            self._log(f"force_chatgpt_entry: 访问 authorize 异常: {e}")
+            return authorize_url
+
     def _submit_authorize_continue(
         self,
         email,
@@ -495,39 +622,35 @@ class OAuthClient:
         authorize_url=None,
         authorize_params=None,
         screen_hint=None,
-        sentinel_override: str | None = None,
     ):
         """提交邮箱，获取 OAuth 流程的第一页状态。"""
         self._log("步骤2: POST /api/accounts/authorize/continue")
 
-        sentinel_token = str(sentinel_override or "").strip()
+        self._log(f"authorize_continue: device_id={device_id}")
+        sentinel_token = get_sentinel_token_via_browser(
+            flow="authorize_continue",
+            proxy=self.proxy,
+            page_url=continue_referer or f"{self.oauth_issuer}/log-in",
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
+            log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
+        )
         if sentinel_token:
-            self._log("authorize_continue: 复用统一 Sentinel token")
+            self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
         else:
-            sentinel_token = get_sentinel_token_via_browser(
+            sentinel_token = build_sentinel_token(
+                self.session,
+                device_id,
                 flow="authorize_continue",
-                proxy=self.proxy,
-                page_url=continue_referer or f"{self.oauth_issuer}/log-in",
-                headless=self.browser_mode != "headed",
-                device_id=device_id,
-                log_fn=lambda msg: self._log(f"authorize_continue: {msg}"),
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
             )
             if sentinel_token:
-                self._log("authorize_continue: 已通过 Playwright SentinelSDK 获取 token")
+                self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
             else:
-                sentinel_token = build_sentinel_token(
-                    self.session,
-                    device_id,
-                    flow="authorize_continue",
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                )
-                if sentinel_token:
-                    self._log("authorize_continue: 已通过 HTTP PoW 获取 token")
-                else:
-                    self._set_error("无法获取 sentinel token (authorize_continue)")
-                    return None
+                self._set_error("无法获取 sentinel token (authorize_continue)")
+                return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/authorize/continue"
         headers = self._headers(
@@ -621,39 +744,35 @@ class OAuthClient:
         sec_ch_ua=None,
         impersonate=None,
         referer=None,
-        sentinel_override: str | None = None,
     ):
         """提交密码，获取下一步状态。"""
         self._log("步骤3: POST /api/accounts/password/verify")
 
-        sentinel_pwd = str(sentinel_override or "").strip()
+        self._log(f"password_verify: device_id={device_id}")
+        sentinel_pwd = get_sentinel_token_via_browser(
+            flow="password_verify",
+            proxy=self.proxy,
+            page_url=referer or f"{self.oauth_issuer}/log-in/password",
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
+            log_fn=lambda msg: self._log(f"password_verify: {msg}"),
+        )
         if sentinel_pwd:
-            self._log("password_verify: 复用统一 Sentinel token")
+            self._log("password_verify: 已通过 Playwright SentinelSDK 获取 token")
         else:
-            sentinel_pwd = get_sentinel_token_via_browser(
+            sentinel_pwd = build_sentinel_token(
+                self.session,
+                device_id,
                 flow="password_verify",
-                proxy=self.proxy,
-                page_url=referer or f"{self.oauth_issuer}/log-in/password",
-                headless=self.browser_mode != "headed",
-                device_id=device_id,
-                log_fn=lambda msg: self._log(f"password_verify: {msg}"),
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
             )
             if sentinel_pwd:
-                self._log("password_verify: 已通过 Playwright SentinelSDK 获取 token")
+                self._log("password_verify: 已通过 HTTP PoW 获取 token")
             else:
-                sentinel_pwd = build_sentinel_token(
-                    self.session,
-                    device_id,
-                    flow="password_verify",
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                )
-                if sentinel_pwd:
-                    self._log("password_verify: 已通过 HTTP PoW 获取 token")
-                else:
-                    self._set_error("无法获取 sentinel token (password_verify)")
-                    return None
+                self._set_error("无法获取 sentinel token (password_verify)")
+                return None
 
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
         headers = self._headers(
@@ -876,6 +995,7 @@ class OAuthClient:
         allow_phone_verification=True,
         force_new_browser=False,
         force_password_login=False,
+        force_chatgpt_entry=False,
         screen_hint="login",
         complete_about_you_if_needed=False,
         first_name="",
@@ -898,6 +1018,7 @@ class OAuthClient:
             prefer_passwordless_login: 是否强制走 passwordless OTP 链路
             allow_phone_verification: add_phone 后是否允许进入手机号验证码分支
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
+            force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
             screen_hint: authorize/continue 的 screen_hint（login/signup）
             first_name: about_you 名字
@@ -922,6 +1043,7 @@ class OAuthClient:
             f"complete_about_you_if_needed={'on' if complete_about_you_if_needed else 'off'}, "
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
+            f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}"
         )
 
@@ -934,30 +1056,6 @@ class OAuthClient:
             if not device_id:
                 device_id = str(uuid.uuid4())
                 self._log(f"OAuth device_id 缺失，已生成新的 device_id={device_id}")
-
-        login_sentinel = get_sentinel_token_via_browser(
-            flow="authorize_continue",
-            proxy=self.proxy,
-            page_url=f"{self.oauth_issuer}/log-in",
-            headless=self.browser_mode != "headed",
-            device_id=device_id,
-            log_fn=lambda msg: self._log(f"login_sentinel: {msg}"),
-        )
-        if login_sentinel:
-            self._log("login_sentinel: 已通过 Playwright SentinelSDK 获取 token")
-        else:
-            login_sentinel = build_sentinel_token(
-                self.session,
-                device_id,
-                flow="authorize_continue",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-            )
-            if login_sentinel:
-                self._log("login_sentinel: 已通过 HTTP PoW 获取 token")
-            else:
-                self._log("login_sentinel: 未生成 sentinel token（继续尝试）")
 
         code_verifier, code_challenge = generate_pkce()
         oauth_state = secrets.token_urlsafe(32)
@@ -973,6 +1071,16 @@ class OAuthClient:
         authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
         seed_oai_device_cookie(self.session, device_id)
+
+        if force_chatgpt_entry:
+            self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
+            _ = self._bootstrap_chatgpt_entry(
+                email,
+                device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
 
         self._log("步骤1: Bootstrap OAuth session...")
         authorize_final_url = self._bootstrap_oauth_session(
@@ -1003,7 +1111,6 @@ class OAuthClient:
             authorize_url=authorize_url,
             authorize_params=authorize_params,
             screen_hint=str(screen_hint or "login"),
-            sentinel_override=login_sentinel,
         )
         if not state:
             if not self.last_error:
@@ -1062,7 +1169,6 @@ class OAuthClient:
                     sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
                     referer=state.current_url or state.continue_url or f"{self.oauth_issuer}/log-in/password",
-                    sentinel_override=login_sentinel,
                 )
                 if not next_state:
                     if not self.last_error:
@@ -1080,7 +1186,6 @@ class OAuthClient:
                     sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
                     referer=state.current_url or state.continue_url or referer,
-                    sentinel_override=login_sentinel,
                 )
                 if not next_state:
                     if not self.last_error:
@@ -1129,7 +1234,6 @@ class OAuthClient:
                     impersonate,
                     skymail_client,
                     state,
-                    sentinel_override=login_sentinel,
                 )
                 if not next_state:
                     if not self.last_error:
@@ -1992,41 +2096,37 @@ class OAuthClient:
         impersonate,
         skymail_client,
         state,
-        sentinel_override: str | None = None,
     ):
         """处理 OAuth 阶段的邮箱 OTP 验证，返回服务端声明的下一步状态。"""
         self._log("步骤4: 检测到邮箱 OTP 验证")
 
         request_url = f"{self.oauth_issuer}/api/accounts/email-otp/validate"
-        sentinel_otp = str(sentinel_override or "").strip()
+        self._log(f"email_otp_validate: device_id={device_id}")
+        sentinel_otp = get_sentinel_token_via_browser(
+            flow="email_otp_validate",
+            proxy=self.proxy,
+            page_url=state.current_url
+            or state.continue_url
+            or f"{self.oauth_issuer}/email-verification",
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
+            log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
+        )
         if sentinel_otp:
-            self._log("email_otp_validate: 复用统一 Sentinel token")
+            self._log("email_otp_validate: 已通过 Playwright SentinelSDK 获取 token")
         else:
-            sentinel_otp = get_sentinel_token_via_browser(
+            sentinel_otp = build_sentinel_token(
+                self.session,
+                device_id,
                 flow="email_otp_validate",
-                proxy=self.proxy,
-                page_url=state.current_url
-                or state.continue_url
-                or f"{self.oauth_issuer}/email-verification",
-                headless=self.browser_mode != "headed",
-                device_id=device_id,
-                log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
             )
             if sentinel_otp:
-                self._log("email_otp_validate: 已通过 Playwright SentinelSDK 获取 token")
+                self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
             else:
-                sentinel_otp = build_sentinel_token(
-                    self.session,
-                    device_id,
-                    flow="email_otp_validate",
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                )
-                if sentinel_otp:
-                    self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
-                else:
-                    self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
+                self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
 
         headers_otp = self._headers(
             request_url,
